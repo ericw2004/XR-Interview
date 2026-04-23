@@ -24,17 +24,21 @@ public static class VRUIInteractorAutoSetup
     public static void AutoSetup()
     {
         // Ensure EventSystem
-        if (EventSystem.current == null)
+        GameObject esGOObj = null;
+        if (EventSystem.current != null)
         {
-            var esGO = new GameObject("EventSystem");
-            esGO.AddComponent<EventSystem>();
-            // Add Standalone by default; we'll replace it with a better module if available
-            esGO.AddComponent<UnityEngine.EventSystems.StandaloneInputModule>();
+            esGOObj = EventSystem.current.gameObject;
+        }
+        else
+        {
+            esGOObj = new GameObject("EventSystem");
+            esGOObj.AddComponent<EventSystem>();
+            esGOObj.AddComponent<UnityEngine.EventSystems.StandaloneInputModule>();
             Debug.Log("[VR AutoSetup] Created EventSystem with StandaloneInputModule.");
         }
 
         // Try to replace the StandaloneInputModule with a more appropriate module if available
-        var esGOObj = EventSystem.current.gameObject;
+        if (esGOObj == null) return;
         // remove existing non-editor input modules (except EventSystem)
         var existingModules = esGOObj.GetComponents<UnityEngine.EventSystems.BaseInputModule>();
         foreach (var m in existingModules)
@@ -151,6 +155,19 @@ public static class VRUIInteractorAutoSetup
         {
             string n = t.name.ToLowerInvariant();
             if (candidates.Any(c => n.Contains(c.ToLowerInvariant()))) return t;
+        }
+
+        // fallback: look for objects that have controller/hand related component types
+        foreach (var t in all)
+        {
+            var comps = t.GetComponents<Component>();
+            foreach (var c in comps)
+            {
+                if (c == null) continue;
+                string type = c.GetType().Name.ToLowerInvariant();
+                if (type.Contains("actionbasedcontroller") || type.Contains("xrcontroller") || type.Contains("trackedposedriver") || type.Contains("ovrcontroller") || type.Contains("hand"))
+                    return t;
+            }
         }
         return null;
     }
