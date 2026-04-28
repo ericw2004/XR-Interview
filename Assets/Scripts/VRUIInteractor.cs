@@ -263,6 +263,60 @@ public class VRUIInteractor : MonoBehaviour
 
         GameObject newUIObject = m_raycastResults.Count > 0 ? m_raycastResults[0].gameObject : null;
 
+        // If GraphicRaycaster didn't find anything, fallback to physics collider on the canvas
+        if (newUIObject == null)
+        {
+            RaycastHit physHit;
+            if (Physics.Raycast(new Ray(rayOrigin, rayDir), out physHit, maxDistance, uiLayerMask))
+            {
+                var hitGO = physHit.collider.gameObject;
+                var physHitCanvas = hitGO.GetComponentInParent<Canvas>();
+                if (physHitCanvas != null)
+                {
+                    Camera useCam = (physHitCanvas.worldCamera != null) ? physHitCanvas.worldCamera : cam;
+                    if (useCam != null)
+                    {
+                        Vector3 sp = useCam.WorldToScreenPoint(physHit.point);
+                        if (sp.z > 0f)
+                        {
+                            m_pointerEventData.position = new Vector2(sp.x, sp.y);
+                            // perform raycast on that specific GraphicRaycaster(s)
+                            var rcs = physHitCanvas.GetComponents<GraphicRaycaster>();
+                            var physResults = new List<RaycastResult>();
+                            foreach (var rc in rcs)
+                            {
+                                if (rc == null) continue;
+                                physResults.Clear();
+                                rc.Raycast(m_pointerEventData, physResults);
+                                if (physResults.Count > 0)
+                                {
+                                    m_raycastResults.AddRange(physResults);
+                                }
+                            }
+
+                            if (m_raycastResults.Count > 0)
+                            {
+                                m_raycastResults.Sort((a, b) => a.distance.CompareTo(b.distance));
+                                m_pointerEventData.pointerCurrentRaycast = m_raycastResults[0];
+                                newUIObject = m_raycastResults[0].gameObject;
+                            }
+                            else
+                            {
+                                // As a last resort, synthesize a RaycastResult pointing to the hit collider's root
+                                var rr = new RaycastResult();
+                                rr.gameObject = hitGO;
+                                rr.worldPosition = physHit.point;
+                                rr.distance = physHit.distance;
+                                rr.screenPosition = new Vector2(sp.x, sp.y);
+                                m_pointerEventData.pointerCurrentRaycast = rr;
+                                newUIObject = hitGO;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Pointer enter / exit
         if (newUIObject != m_currentUIObject)
         {
