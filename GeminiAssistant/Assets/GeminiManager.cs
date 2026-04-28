@@ -6,7 +6,7 @@ using System;
 
 public class GeminiManager : MonoBehaviour
 {
-    public string apiKey = "AIzaSyAuc_XX8n-CRrz6-0xfiDbcyp3B2E80jYI";
+    public string apiKey = "INSERT API KEY";
 
     public Action<string> OnResponse;
 
