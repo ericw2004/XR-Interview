@@ -1,9 +1,10 @@
+using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using UnityEngine.XR;
-using UnityEngine.XR.Hands;
 
 [AddComponentMenu("VR/VR UI Interactor")]
 public class VRUIInteractor : MonoBehaviour
@@ -14,10 +15,12 @@ public class VRUIInteractor : MonoBehaviour
     public HandSide handSide = HandSide.Right;
     [Tooltip("Threshold for controller trigger (0..1).")]
     public float triggerThreshold = 0.1f;
-    [Tooltip("Distance between thumb and index tips to register a pinch (meters).")]
-    public float pinchDistance = 0.03f;
+    [Tooltip("Distance between thumb and index tips to register a pinch (meters). Default 0.04 = 4 cm.")]
+    public float pinchDistance = 0.04f;
 
     [Header("Ray")]
+    [Tooltip("Override the ray origin transform. If null, defaults to this GameObject's transform.")]
+    public Transform pointerOrigin;
     public float maxDistance = 10f;
     public LayerMask uiLayerMask = ~0;
     public Color laserColor = new Color(0.0f, 0.7f, 1.0f, 1.0f);
@@ -34,13 +37,13 @@ public class VRUIInteractor : MonoBehaviour
     private GameObject m_pointerPress;
     private bool m_isPressed;
     private XRNode m_xrNode;
-    private XRHandSubsystem m_handSubsystem;
+    private ReflectionHandsProvider m_handsProvider;
+    private List<GraphicRaycaster> m_cachedRaycasters;
 
     void Awake()
     {
         m_xrNode = (handSide == HandSide.Left) ? XRNode.LeftHand : XRNode.RightHand;
 
-        // Ensure EventSystem exists
         if (EventSystem.current == null)
         {
             var esGO = new GameObject("EventSystem");
@@ -50,7 +53,7 @@ public class VRUIInteractor : MonoBehaviour
 
         m_pointerEventData = new PointerEventData(EventSystem.current);
 
-        // Create line renderer for laser
+        // Line renderer for laser
         m_line = gameObject.AddComponent<LineRenderer>();
         m_line.positionCount = 2;
         m_line.startWidth = laserWidth;
@@ -62,7 +65,7 @@ public class VRUIInteractor : MonoBehaviour
         m_line.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         m_line.receiveShadows = false;
 
-        // Create hit indicator dot
+        // Hit indicator dot
         m_hitDot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
         m_hitDot.transform.localScale = Vector3.one * 0.02f;
         var mr = m_hitDot.GetComponent<MeshRenderer>();
@@ -74,109 +77,193 @@ public class VRUIInteractor : MonoBehaviour
         DestroyImmediate(m_hitDot.GetComponent<Collider>());
         m_hitDot.SetActive(false);
 
-        // Get hand subsystem for OpenXR hands
-        var handSubsystems = new List<XRHandSubsystem>();
-        SubsystemManager.GetSubsystems(handSubsystems);
-        if (handSubsystems.Count > 0)
-            m_handSubsystem = handSubsystems[0];
+        // Reflection-based hands provider — compiles with or without XR Hands package
+        m_handsProvider = new ReflectionHandsProvider();
+        m_handsProvider.Init();
     }
 
     void Update()
     {
-        Vector3 rayOrigin = transform.position;
-        Vector3 rayDir = transform.forward;
+        // Start from the assigned pointer origin or this transform.
+        // Both hand tracking and controller branches may override these below.
+        Transform originTransform = pointerOrigin != null ? pointerOrigin : transform;
+        Vector3 rayOrigin = originTransform.position;
+        Vector3 rayDir    = originTransform.forward;
         bool isPressedThisFrame = false;
 
-        // Try to get OpenXR hand joints for finger pointing
-        if (m_handSubsystem != null && m_handSubsystem.running)
-        {
-            XRHand hand = (handSide == HandSide.Left) ? m_handSubsystem.leftHand : m_handSubsystem.rightHand;
-            if (hand.isTracked)
-            {
-                // Get index tip and index proximal for pointing direction
-                if (hand.GetJoint(XRHandJointID.IndexTip).TryGetPose(out Pose indexTipPose) &&
-                    hand.GetJoint(XRHandJointID.IndexIntermediate).TryGetPose(out Pose indexMidPose))
-                {
-                    rayOrigin = indexTipPose.position;
-                    rayDir = (indexTipPose.position - indexMidPose.position).normalized;
-                }
+        // --- Determine input mode each frame independently ---
+        // This means switching between hands and controllers mid-session works
+        // without any stale state: whichever is active this frame wins.
 
-                // Check for pinch (index + thumb distance)
-                if (hand.GetJoint(XRHandJointID.IndexTip).TryGetPose(out Pose iTip) &&
-                    hand.GetJoint(XRHandJointID.ThumbTip).TryGetPose(out Pose tTip))
+        bool handTrackedThisFrame = false;
+        var rhSide = (handSide == HandSide.Left)
+            ? ReflectionHandsProvider.HandSide.Left
+            : ReflectionHandsProvider.HandSide.Right;
+
+        if (m_handsProvider != null && m_handsProvider.IsAvailable &&
+            m_handsProvider.IsHandTracked(rhSide))
+        {
+            handTrackedThisFrame = true;
+
+            // MetaOS-style ray: origin at IndexProximal (knuckle), aimed toward IndexTip.
+            // Starting at the knuckle instead of the fingertip means the ray endpoint
+            // stays stable when the fingers come together for a pinch.
+            Pose proximalPose, tipPose;
+            bool hasProximal = m_handsProvider.TryGetJointPose(rhSide, "IndexProximal", out proximalPose);
+            bool hasTip      = m_handsProvider.TryGetJointPose(rhSide, "IndexTip",      out tipPose);
+
+            if (hasProximal && hasTip)
+            {
+                Vector3 d = (tipPose.position - proximalPose.position).normalized;
+                if (d.sqrMagnitude > 0.001f) { rayOrigin = proximalPose.position; rayDir = d; }
+            }
+            else if (hasTip)
+            {
+                Pose midPose;
+                if (m_handsProvider.TryGetJointPose(rhSide, "IndexIntermediate", out midPose))
                 {
-                    float pinchDist = Vector3.Distance(iTip.position, tTip.position);
-                    isPressedThisFrame = pinchDist < pinchDistance;
+                    Vector3 d = (tipPose.position - midPose.position).normalized;
+                    if (d.sqrMagnitude > 0.001f) { rayOrigin = midPose.position; rayDir = d; }
                 }
             }
+
+            // Pinch: index tip <-> thumb tip with 1 cm release hysteresis to avoid flicker.
+            Pose iTip, tTip;
+            if (m_handsProvider.TryGetJointPose(rhSide, "IndexTip",  out iTip) &&
+                m_handsProvider.TryGetJointPose(rhSide, "ThumbTip", out tTip))
+            {
+                float dist = Vector3.Distance(iTip.position, tTip.position);
+                float releaseThreshold = pinchDistance + 0.01f;
+                isPressedThisFrame = m_isPressed ? (dist < releaseThreshold) : (dist < pinchDistance);
+            }
         }
-        else
+
+        // Controller input — evaluated every frame, not just as a fallback,
+        // so the ray follows the physical controller the moment hands are lost.
+        if (!handTrackedThisFrame)
         {
-            // Fallback: controller trigger
             var device = InputDevices.GetDeviceAtXRNode(m_xrNode);
             if (device.isValid)
             {
-                // Try trigger float
+                // Drive ray from live device pose so it always follows the controller.
+                if (device.TryGetFeatureValue(CommonUsages.devicePosition, out Vector3 devicePos) &&
+                    device.TryGetFeatureValue(CommonUsages.deviceRotation, out Quaternion deviceRot))
+                {
+                    // Guard against zero-pose returned before first tracking packet
+                    if (devicePos != Vector3.zero || deviceRot != Quaternion.identity)
+                    {
+                        rayOrigin = devicePos;
+                        rayDir    = deviceRot * Vector3.forward;
+                    }
+                }
+
+                // Trigger input
                 if (device.TryGetFeatureValue(CommonUsages.trigger, out float triggerValue))
-                {
                     isPressedThisFrame = triggerValue > triggerThreshold;
-                }
-                // Fallback to trigger button
                 else if (device.TryGetFeatureValue(CommonUsages.triggerButton, out bool triggerButton))
-                {
                     isPressedThisFrame = triggerButton;
-                }
             }
         }
 
-        // Cast ray
-        Ray ray = new Ray(rayOrigin, rayDir);
-        RaycastHit hitInfo;
-        bool hit = Physics.Raycast(ray, out hitInfo, maxDistance, uiLayerMask);
+        // --- Canvas-plane hit detection ---
+        // Physics.Raycast is skipped: canvas objects live on the Default layer, not the UI
+        // physics layer, so a ray-plane intersection against each world-space canvas plane
+        // is the only reliable way to find what the controller is pointing at.
 
-        Vector3 hitWorldPos = rayOrigin + rayDir * maxDistance;
-        float hitDistance = maxDistance;
+        // Refresh raycaster cache every ~2 seconds (120 frames at 60 fps)
+        if (m_cachedRaycasters == null || Time.frameCount % 120 == 0)
+            m_cachedRaycasters = new List<GraphicRaycaster>(
+                GameObject.FindObjectsOfType<GraphicRaycaster>());
 
-        if (hit)
+        Camera cam = uiCamera != null ? uiCamera : Camera.main;
+
+        float   closestT  = maxDistance;
+        Vector3 canvasHit = rayOrigin + rayDir * maxDistance;
+
+        if (cam != null)
         {
-            hitWorldPos = hitInfo.point;
-            hitDistance = hitInfo.distance;
+            foreach (var rc in m_cachedRaycasters)
+            {
+                if (rc == null) continue;
+                var canvas = rc.GetComponent<Canvas>();
+                if (canvas == null || canvas.renderMode != RenderMode.WorldSpace) continue;
+
+                Vector3 planeNormal = canvas.transform.forward;
+                float   denom       = Vector3.Dot(planeNormal, rayDir);
+                if (Mathf.Abs(denom) < 0.001f) continue;   // ray parallel to canvas
+
+                float t = Vector3.Dot(canvas.transform.position - rayOrigin, planeNormal) / denom;
+                if (t <= 0f || t >= closestT) continue;
+
+                // Confirm intersection is in front of the camera before accepting it
+                Vector3 sp3 = cam.WorldToScreenPoint(rayOrigin + rayDir * t);
+                if (sp3.z <= 0f) continue;
+
+                closestT  = t;
+                canvasHit = rayOrigin + rayDir * t;
+            }
         }
+
+        bool  hitCanvas   = closestT < maxDistance;
+        float hitDistance = closestT;
 
         // Draw laser
         m_line.SetPosition(0, rayOrigin);
-        m_line.SetPosition(1, hitWorldPos);
+        m_line.SetPosition(1, canvasHit);
 
-        // Update hit dot
-        m_hitDot.SetActive(true);
-        m_hitDot.transform.position = hitWorldPos;
+        // Hit dot — only show when the ray intersects a canvas
+        m_hitDot.SetActive(hitCanvas);
+        m_hitDot.transform.position   = canvasHit;
         m_hitDot.transform.localScale = Vector3.one * Mathf.Max(0.01f, hitDistance * 0.01f);
 
-        // UI raycast
-        Camera cam = uiCamera != null ? uiCamera : Camera.main;
+        // --- UI interaction ---
         if (cam == null) return;
 
-        Vector3 screenPoint = cam.WorldToScreenPoint(hitWorldPos);
+        if (!hitCanvas)
+        {
+            if (m_currentUIObject != null)
+            {
+                ExecuteEvents.Execute(m_currentUIObject, m_pointerEventData,
+                    ExecuteEvents.pointerExitHandler);
+                m_currentUIObject = null;
+            }
+            return;
+        }
+
         m_pointerEventData.Reset();
-        m_pointerEventData.position = new Vector2(screenPoint.x, screenPoint.y);
         m_pointerEventData.button = PointerEventData.InputButton.Left;
 
-        // Find UI elements at hit point
+        // GraphicRaycaster pass — test all world-space canvases and pick the closest hit.
         m_raycastResults.Clear();
-        var raycasters = GameObject.FindObjectsOfType<GraphicRaycaster>();
-        foreach (var rc in raycasters)
+        var tempResults = new List<RaycastResult>();
+        foreach (var rc in m_cachedRaycasters)
         {
-            rc.Raycast(m_pointerEventData, m_raycastResults);
-            if (m_raycastResults.Count > 0)
-            {
-                m_pointerEventData.pointerCurrentRaycast = m_raycastResults[0];
-                break;
-            }
+            if (rc == null) continue;
+            var canvas = rc.GetComponent<Canvas>();
+            Camera useCam = (canvas != null && canvas.worldCamera != null) ? canvas.worldCamera : cam;
+            if (useCam == null) continue;
+
+            // compute screen point for this canvas' camera
+            Vector3 sp = useCam.WorldToScreenPoint(canvasHit);
+            if (sp.z <= 0f) continue; // behind this camera
+
+            m_pointerEventData.position = new Vector2(sp.x, sp.y);
+            tempResults.Clear();
+            rc.Raycast(m_pointerEventData, tempResults);
+            if (tempResults.Count > 0)
+                m_raycastResults.AddRange(tempResults);
+        }
+
+        // choose nearest result (smallest distance)
+        if (m_raycastResults.Count > 0)
+        {
+            m_raycastResults.Sort((a, b) => a.distance.CompareTo(b.distance));
+            m_pointerEventData.pointerCurrentRaycast = m_raycastResults[0];
         }
 
         GameObject newUIObject = m_raycastResults.Count > 0 ? m_raycastResults[0].gameObject : null;
 
-        // Handle pointer enter/exit
+        // Pointer enter / exit
         if (newUIObject != m_currentUIObject)
         {
             if (m_currentUIObject != null)
@@ -188,16 +275,17 @@ public class VRUIInteractor : MonoBehaviour
                 ExecuteEvents.Execute(m_currentUIObject, m_pointerEventData, ExecuteEvents.pointerEnterHandler);
         }
 
-        // Handle press/release
+        // Press / release — fires pointerClick on release, matching Unity UI convention
         if (isPressedThisFrame && !m_isPressed)
         {
             m_isPressed = true;
             if (m_currentUIObject != null)
             {
-                m_pointerEventData.pressPosition = m_pointerEventData.position;
+                m_pointerEventData.pressPosition       = m_pointerEventData.position;
                 m_pointerEventData.pointerPressRaycast = m_pointerEventData.pointerCurrentRaycast;
 
-                var handler = ExecuteEvents.ExecuteHierarchy(m_currentUIObject, m_pointerEventData, ExecuteEvents.pointerDownHandler);
+                var handler = ExecuteEvents.ExecuteHierarchy(
+                    m_currentUIObject, m_pointerEventData, ExecuteEvents.pointerDownHandler);
                 m_pointerPress = handler != null ? handler : m_currentUIObject;
                 EventSystem.current.SetSelectedGameObject(m_pointerPress);
             }
@@ -208,7 +296,8 @@ public class VRUIInteractor : MonoBehaviour
             if (m_pointerPress != null)
             {
                 ExecuteEvents.Execute(m_pointerPress, m_pointerEventData, ExecuteEvents.pointerUpHandler);
-                ExecuteEvents.Execute(m_pointerPress, m_pointerEventData, ExecuteEvents.pointerClickHandler);
+                if (m_currentUIObject != null)
+                    ExecuteEvents.Execute(m_pointerPress, m_pointerEventData, ExecuteEvents.pointerClickHandler);
             }
             m_pointerPress = null;
         }
@@ -216,7 +305,140 @@ public class VRUIInteractor : MonoBehaviour
 
     void OnDisable()
     {
+        // Clean up hover/press state so re-enabling doesn't leave ghost events
+        if (m_currentUIObject != null)
+        {
+            ExecuteEvents.Execute(m_currentUIObject, m_pointerEventData, ExecuteEvents.pointerExitHandler);
+            m_currentUIObject = null;
+        }
+        if (m_pointerPress != null)
+        {
+            ExecuteEvents.Execute(m_pointerPress, m_pointerEventData, ExecuteEvents.pointerUpHandler);
+            m_pointerPress = null;
+        }
+        m_isPressed = false;
+
         if (m_hitDot != null)
             m_hitDot.SetActive(false);
+    }
+}
+
+/// <summary>
+/// Accesses UnityEngine.XR.Hands types via reflection so the script compiles and runs
+/// regardless of whether the XR Hands package is installed. When the package is absent,
+/// IsAvailable returns false and the caller falls back to controller input.
+/// </summary>
+public class ReflectionHandsProvider
+{
+    public enum HandSide { Left, Right }
+
+    private Type       m_xrHandSubsystemType;
+    private Type       m_xrHandJointIDType;
+    private Type       m_xrHandType;
+    private Type       m_xrHandJointType;
+    private MethodInfo m_tryGetJointMethod;
+    private MethodInfo m_jointTryGetPoseMethod;
+    private object     m_subsystem;
+
+    public bool IsAvailable { get; private set; }
+
+    public void Init()
+    {
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (m_xrHandSubsystemType == null) m_xrHandSubsystemType = asm.GetType("UnityEngine.XR.Hands.XRHandSubsystem");
+                if (m_xrHandJointIDType   == null) m_xrHandJointIDType   = asm.GetType("UnityEngine.XR.Hands.XRHandJointID");
+                if (m_xrHandType          == null) m_xrHandType          = asm.GetType("UnityEngine.XR.Hands.XRHand");
+                if (m_xrHandJointType     == null) m_xrHandJointType     = asm.GetType("UnityEngine.XR.Hands.XRHandJoint");
+
+                if (m_xrHandSubsystemType != null && m_xrHandJointIDType != null &&
+                    m_xrHandType != null && m_xrHandJointType != null) break;
+            }
+
+            if (m_xrHandSubsystemType == null || m_xrHandJointIDType == null ||
+                m_xrHandType == null  || m_xrHandJointType == null)
+            { IsAvailable = false; return; }
+
+            m_tryGetJointMethod = m_xrHandType.GetMethod("GetJoint",
+                BindingFlags.Public | BindingFlags.Instance,
+                null, new[] { m_xrHandJointIDType }, null);
+
+            m_jointTryGetPoseMethod = m_xrHandJointType.GetMethod("TryGetPose",
+                BindingFlags.Public | BindingFlags.Instance);
+
+            if (m_tryGetJointMethod == null || m_jointTryGetPoseMethod == null)
+            { IsAvailable = false; return; }
+
+            IsAvailable = true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[ReflectionHandsProvider] Init failed: " + e.Message);
+            IsAvailable = false;
+        }
+    }
+
+    private bool TryGetSubsystem()
+    {
+        if (!IsAvailable) return false;
+        try
+        {
+            var listType      = typeof(List<>).MakeGenericType(m_xrHandSubsystemType);
+            var list          = Activator.CreateInstance(listType);
+            var getSubsystems = typeof(SubsystemManager).GetMethod("GetSubsystems", BindingFlags.Public | BindingFlags.Static);
+            if (getSubsystems == null) return false;
+            getSubsystems.MakeGenericMethod(m_xrHandSubsystemType).Invoke(null, new[] { list });
+
+            int count = (int)listType.GetProperty("Count").GetValue(list);
+            if (count == 0) { m_subsystem = null; return false; }
+
+            m_subsystem = listType.GetProperty("Item").GetValue(list, new object[] { 0 });
+            return m_subsystem != null;
+        }
+        catch { m_subsystem = null; return false; }
+    }
+
+    public bool IsHandTracked(HandSide side)
+    {
+        if (!TryGetSubsystem()) return false;
+        try
+        {
+            string propName  = side == HandSide.Left ? "leftHand" : "rightHand";
+            var    handProp  = m_xrHandSubsystemType.GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+            if (handProp == null) return false;
+            object hand      = handProp.GetValue(m_subsystem);
+            var    trackedProp = m_xrHandType.GetProperty("isTracked", BindingFlags.Public | BindingFlags.Instance);
+            if (trackedProp == null) return false;
+            return (bool)trackedProp.GetValue(hand);
+        }
+        catch { return false; }
+    }
+
+    public bool TryGetJointPose(HandSide side, string jointName, out Pose pose)
+    {
+        pose = Pose.identity;
+        if (!TryGetSubsystem()) return false;
+        try
+        {
+            string propName = side == HandSide.Left ? "leftHand" : "rightHand";
+            var    handProp = m_xrHandSubsystemType.GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+            if (handProp == null) return false;
+            object hand = handProp.GetValue(m_subsystem);
+
+            object jointID;
+            try { jointID = Enum.Parse(m_xrHandJointIDType, jointName); }
+            catch { return false; }
+
+            object joint = m_tryGetJointMethod.Invoke(hand, new[] { jointID });
+            if (joint == null) return false;
+
+            var    poseArgs = new object[] { Pose.identity };
+            bool   success  = (bool)m_jointTryGetPoseMethod.Invoke(joint, poseArgs);
+            if (success) pose = (Pose)poseArgs[0];
+            return success;
+        }
+        catch { return false; }
     }
 }
