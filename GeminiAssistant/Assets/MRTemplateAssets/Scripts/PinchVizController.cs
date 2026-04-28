@@ -6,18 +6,28 @@ public class PinchVizController : MonoBehaviour
     [SerializeField]
     SkinnedMeshRenderer m_Pointer;
 
-    XRRayInteractor m_Interactor;
+    XRRayInteractor m_RayInteractor;
+    NearFarInteractor m_NearFarInteractor;
 
-    // Start is called before the first frame update
     void Start()
     {
-        m_Interactor = this.GetComponent<XRRayInteractor>();
+        m_RayInteractor = GetComponent<XRRayInteractor>();
+        m_NearFarInteractor = GetComponent<NearFarInteractor>();
+
+        if (m_RayInteractor == null && m_NearFarInteractor == null)
+            Debug.LogWarning("PinchVizController: No XRRayInteractor or NearFarInteractor found on this GameObject.", this);
     }
 
-    // Update is called once per frame
     void Update()
     {
-        var inputValue = Mathf.Max(m_Interactor.selectInput.ReadValue(), m_Interactor.uiPressInput.ReadValue());
+        if (m_Pointer == null) return;
+
+        float inputValue = 0f;
+        if (m_RayInteractor != null)
+            inputValue = Mathf.Max(m_RayInteractor.selectInput.ReadValue(), m_RayInteractor.uiPressInput.ReadValue());
+        else if (m_NearFarInteractor != null)
+            inputValue = Mathf.Max(m_NearFarInteractor.selectInput.ReadValue(), m_NearFarInteractor.uiPressInput.ReadValue());
+
         m_Pointer.SetBlendShapeWeight(0, inputValue * 100f);
     }
 }
