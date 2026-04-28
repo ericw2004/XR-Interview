@@ -7,9 +7,12 @@ public class VRUIRuntimeAutoAttacher : MonoBehaviour
 {
     void Awake()
     {
-        // If any VRUIInteractor already exists, assume setup done
-        var existing = FindObjectOfType<VRUIInteractor>();
-        if (existing != null)
+        // Count existing interactors per side. If both hands already have one, skip.
+        // Bailing on the first found was preventing the second hand's ray from being created.
+        var existingAll = FindObjectsOfType<VRUIInteractor>();
+        bool hasLeft  = System.Array.Exists(existingAll, i => i.handSide == VRUIInteractor.HandSide.Left);
+        bool hasRight = System.Array.Exists(existingAll, i => i.handSide == VRUIInteractor.HandSide.Right);
+        if (hasLeft && hasRight)
             return;
 
         // candidate name keywords
