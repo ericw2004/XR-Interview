@@ -5,8 +5,8 @@ using System.Collections;
 
 public class WhisperRunner : MonoBehaviour
 {
-    public string pythonPath = @"C:\Users\curyt\AppData\Local\Python\bin\python.exe";
-    public string scriptPath = @"C:\Users\curyt\Documents\transcribe.py";
+    public string pythonPath = @"PATH TO python.exe";
+    public string scriptPath = @"PATH TO transcriber.exe";
 
     // Event to send cleaned transcription to ChatUI
     public event Action<string> OnTranscription;
